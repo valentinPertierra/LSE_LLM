@@ -12,4 +12,4 @@ En este trabajo práctico se implementó un sistema RAG con agentes, capaz de id
 
 ## TP3 
 ![](TP3/futuristic_city.png)
-En este trabajo práctico se utiliza un modelo multimodal para generar imágenes a partir de un texo. 
+En este [trabajo práctico](https://github.com/valentinPertierra/LSE_LLM/blob/main/TP3/TP3.ipynb) se utiliza un modelo multimodal para generar imágenes a partir de un texo. 
