@@ -1,11 +1,17 @@
-# iniciar con: streamlit run chatbot_gestionada.py
+# iniciar con: streamlit run agent_rag.py
 
 
 import streamlit as st
+import os
 from groq import Groq
-import random
+
+from pinecone import Pinecone, ServerlessSpec
+from langchain_pinecone import PineconeVectorStore
+from langchain.embeddings import HuggingFaceEmbeddings
 
 from langchain.chains import ConversationChain, LLMChain
+from langchain_groq import ChatGroq
+from langchain.prompts import PromptTemplate
 from langchain_core.prompts import (
     ChatPromptTemplate,
     HumanMessagePromptTemplate,
@@ -13,13 +19,14 @@ from langchain_core.prompts import (
 )
 from langchain_core.messages import SystemMessage
 from langchain.chains.conversation.memory import ConversationBufferWindowMemory
-from langchain_groq import ChatGroq
-from langchain.prompts import PromptTemplate
-import os
 
-from pinecone import Pinecone, ServerlessSpec
-from langchain_pinecone import PineconeVectorStore
-from langchain.embeddings import HuggingFaceEmbeddings
+from typing_extensions import List, TypedDict
+from langchain_core.documents import Document
+from langgraph.graph import START, StateGraph, END
+from langchain import hub
+from langchain.prompts import PromptTemplate
+
+import re
 
 
 from dotenv import load_dotenv
@@ -37,7 +44,7 @@ def main():
     load_dotenv()
 
     # Obtener la clave API de Groq
-    groq_api_key = os.getenv('GROQ_API_KEY')  
+    GROQ_API_KEY = os.getenv('GROQ_API_KEY')  
 
     # API key de piencone
     PINECONE_API_KEY=os.getenv("PINECONE_API_KEY")
@@ -48,157 +55,179 @@ def main():
 
     # Cargo un modelo de embeddings compatible
     embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    
 
-    vectorstore = PineconeVectorStore(
-        index_name='raglse',
-        embedding=embedding_model,
-        namespace='espacio',
+    # Inicializo el agente 
+    llm = ChatGroq(
+        groq_api_key=GROQ_API_KEY, 
+        model_name='llama3-8b-8192'
     )
+
+    # Defino un tamplate para el prompt
+    prompt = PromptTemplate(
+        input_variables=["context", "question", "individual"],
+        template="""
+    Eres un asistente para tareas de preguntas y respuestas. Usa los siguientes fragmentos de historia y contexto recuperados para responder la pregunta respecto al individuo.
+    Si no sabes la respuesta, di que no lo sabes. Usa un máximo de 200 palabras y mantén la respuesta concisa. 
+    ---
+    Historia:
+    {history}
+    ---
+    Contexto:
+    {context}
+    ---
+    Individuo:
+    {individual}
+    ---
+    Pregunta: {question}
+    Respuesta:
+    """
+    )
+
+    # Defino una clase para guardar el estado 
+    class State(TypedDict):
+        question: str
+        context: List[Document]
+        answer: str
+        individual: str
+        history: List[str] 
+
+
+    # Defino una clase agente para hacer la busqueda en la base vectorial segun la persona
+    class Agent:
+        
+        def __init__(self, embedding_model, index="", namespace="espacio"):
+            if index=="":
+                raise ValueError("No se especifico un índice válido.")
+            
+            self.index = index
+            self.embedding_model = embedding_model
+
+            self.vectorstore = PineconeVectorStore(
+                index_name=index,
+                embedding=self.embedding_model,
+                namespace=namespace,
+            )
+
+        def get_context(self,state: State):
+
+            retrieved_docs = self.vectorstore.similarity_search(state["question"],k=2)
+            print(retrieved_docs)
+            return {"context": retrieved_docs}
+
+
+    # Defino los nodos para el agente
+    def generate(state: State):
+        if state["context"]:
+            docs_content = "\n\n".join(doc.page_content for doc in state["context"])
+        else: 
+            docs_content = ""
+        # Formateo la historia como un unico string
+        history = "\n".join(state["history"])
+        
+        # Invoco el prompt con contexto e historia previa
+        messages = prompt.invoke({
+            "question": state["question"],
+            "context": docs_content,
+            "individual": state["individual"],
+            "history": history
+        })
+
+        # print(messages)
+        response = llm.invoke(messages)
+        
+        state["history"].append(f"Q: {state['question']} A: {response.content}")
+        
+        # Ahora ya es posible devolver la respuesta
+        return {"answer": response.content}
+
+    # Nodo para limpiar el contexto
+    def empty_context(state:State):
+        return {"context":[]}
+
+    # Segun sobre a quien se refiere la pregunta se utiliza un agente u otro
+    def decide(state: State):
+        
+        valentin_pattern = r"(Valentin\sPertierra|Valentin|Pertierra)"
+        juan_pattern = r"(Juan\sPérez|Juan|Pérez)"
+        individual = "" 
+        
+        if re.search(valentin_pattern, state["question"], re.IGNORECASE):
+            individual = "valentin"
+        elif re.search(juan_pattern, state["question"], re.IGNORECASE):
+            individual = "juan"
+        return {"individual":individual}
+
+    # Funcion para determinar cuál es el próximo nodo
+    def decision_read_state(state:State):
+        """Obtiene el individuo desde el state y lo retorna para decidir por qué nodo continuar."""
+        indiv = state["individual"]
+        if indiv=="":
+            print("La pregunta no habla de ningun individuo.")
+            return "no_individual"
+        print("La pregunta habla sobre el individuo:",indiv)
+        return indiv
+
+
+    
+
+    # Instancio agentes
+    vagent = Agent(embedding_model,"vagent")
+    jagent = Agent(embedding_model,"jagent")
+
+    # Armo el grafo de nodos
+    graph_builder = StateGraph(State)
+    graph_builder.add_node("decision",decide)
+    graph_builder.add_node("valentin_agent",vagent.get_context)
+    graph_builder.add_node("juan_agent",jagent.get_context)
+    graph_builder.add_node("generate",generate)
+    graph_builder.add_conditional_edges(
+        "decision",
+        decision_read_state,
+        {"valentin": "valentin_agent","juan": "juan_agent","no_individual":"valentin_agent"}
+        )
+    graph_builder.add_edge("valentin_agent","generate")
+    graph_builder.add_edge("juan_agent","generate")
+    graph_builder.set_entry_point("decision")
+    graph = graph_builder.compile()
+
+
 
     # Aplicacion de Streamlit   
     st.set_page_config(
-        page_title="Chatbot RAG",
+        page_title="Chatbot Agent RAG",
         page_icon="🤖",
-        layout="wide"
+        #layout="wide"
     )
 
     # El título y mensaje de bienvenida de la aplicación Streamlit
-    st.title("Chatbot RAG")
-    st.write("¡Hola! Este es un chatbot para interactuar con archivos PDF. Carga un archivo y pregunta lo que quieras!")
+    st.title("Chatbot Agent RAG")
+    st.write("¡Hola! Este es un chatbot para interactuar con los CV de Valentin y Juan. Pregunta lo que quieras!")
 
-    # Agregar opciones de personalización en la barra lateral
-    st.sidebar.title('Personalización')
-       
-    #pdf_file = st.sidebar.file_uploader("Sube un archivo PDF", type=["pdf"])
-    #if pdf_file is not None:
-    #    save_pdf(pdf_file, "pdfs")
-
-    #if st.sidebar.button("Agregar a base vectorial"):
-    #    load_vectordb(pdf_file)
-
-    model = st.sidebar.selectbox(
-        'Elige un modelo',
-        ['llama3-8b-8192', 'mixtral-8x7b-32768', 'gemma-7b-it']
-    )
-    conversational_memory_length = st.sidebar.slider('Longitud de la memoria conversacional:', 1, 10, value = 5)
-
-    memory = ConversationBufferWindowMemory(k=conversational_memory_length, memory_key="historial_chat", return_messages=True)
 
     user_question = st.text_input("Haz una pregunta:")
 
     # Variable de estado de la sesión
-    if 'historial_chat' not in st.session_state:
-        st.session_state.historial_chat=[]
-    else:
-        for message in st.session_state.historial_chat:
-            memory.save_context(
-                {'input': message['humano']},
-                {'output': message['IA']}
-            )
+    if "historial_chat" not in st.session_state:
+        st.session_state.conversation_history = {
+            "question": "",
+            "context": [],
+            "answer": "",
+            "history": []  
+        }
 
-
-    # Inicializar el objeto de chat Groq con Langchain
-    groq_chat = ChatGroq(
-        groq_api_key=groq_api_key, 
-        model_name=model
-    )
-
+   
 
     # Si el usuario ha hecho una pregunta,
     if user_question:
 
-        # Busco contenido similar en la base de datos
-        context = vectorstore.similarity_search(user_question, k=3)
-        #print("context",context)
-        system_prompt = f'Eres un asistente para tareas de preguntas y respuestas. \
-        Usa los siguientes fragmentos de contexto recuperados para responder la pregunta. \
-        Si no sabes la respuesta, di que no lo sabes. Usa un máximo de tres oraciones y mantén la respuesta concisa. \n\n \
-        {context}'
-
-        # Construir una plantilla de mensaje de chat utilizando varios componentes
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                SystemMessage(
-                    content=system_prompt
-                ),  # Este es el mensaje del sistema persistente que siempre se incluye al inicio del chat.
-
-                MessagesPlaceholder(
-                    variable_name="historial_chat"
-                ),  # Este marcador de posición será reemplazado por el historial de chat real durante la conversación. Ayuda a mantener el contexto.
-
-                HumanMessagePromptTemplate.from_template(
-                    "{human_input}"
-                ),  # Esta plantilla es donde se inyectará la entrada actual del usuario en el mensaje.
-            ]
-        )
-
-        # Crear una cadena de conversación utilizando el LLM (Modelo de Lenguaje) de LangChain
-        conversation = LLMChain(
-            llm=groq_chat,  # El objeto de chat Groq LangChain inicializado anteriormente.
-            prompt=prompt,  # La plantilla de mensaje construida.
-            verbose=True,   # Habilita la salida detallada, lo cual puede ser útil para depurar.
-            memory=memory,  # El objeto de memoria conversacional que almacena y gestiona el historial de la conversación.
-        )
-        
-        # La respuesta del chatbot se genera enviando el mensaje completo a la API de Groq.
-        try:
-            response = conversation.predict(human_input=user_question)
-            message = {'humano': user_question, 'IA': response}
-            st.session_state.historial_chat.append(message)
-
-        except Exception as e:
-            response = f"Error! {e}"
-
-        st.write("Chatbot:", response)
+        st.session_state.conversation_history["question"] = user_question
+        print(st.session_state.conversation_history)
+        response = graph.invoke(st.session_state.conversation_history)
+        st.write("Chatbot:", response["answer"])
 
 
-def read_pdf(pdf_file):
 
-    pdf_reader = PyPDF2.PdfReader(pdf_file)
-    texto = ""
-    for page in pdf_reader.pages:
-        texto += page.extract_text()
-    
-    return texto
-
-
-def save_pdf(pdf_file, output_dir="pdfs"):
-
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-    
-    # Borro todo lo que habia antes, por ahora solo funciona con un solo documento  
-    for archivo in os.listdir(output_dir):
-        archivo_path = os.path.join(output_dir, archivo)
-        if os.path.isfile(archivo_path):
-            os.remove(archivo_path)
-                
-    file_path = os.path.join(output_dir, pdf_file.name)
-    with open(file_path, "wb") as f:
-        f.write(pdf_file.getbuffer())
-    
-    return file_path
-
-
-# Genero los chunks
-def chunkData(docs, chunk_size=100, chunk_overlap=50):
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-    chunks = text_splitter.split_documents(docs)
-    return chunks
-
-
-# Cargo el archivo pdf a la base de datos vectorial
-def load_vectordb(filePath):
-    
-    print("aca deberia hacer la logica para cargar el documento a la base de datos vectorial")
-    '''
-    # Cargo el documento
-    loader = PyPDFLoader(filePath)
-    docs = loader.load()
-
-    # Genero los chunks 
-    chunks = chunkData(docs, chunk_size=200, chunk_overlap=100)
-    '''
 
 
 
